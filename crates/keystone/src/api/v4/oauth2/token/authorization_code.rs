@@ -24,7 +24,7 @@ use governor::clock::Clock as _;
 use openstack_keystone_core::oauth2_client::{
     IdTokenParams, TemplateScope, build_id_token_claims, pkce,
 };
-use openstack_keystone_core::oauth2_session::IssueRefreshTokenRequest;
+use openstack_keystone_core::oauth2_session::{IssueRefreshTokenRequest, derive_sid, sso_ref};
 use openstack_keystone_core_types::oauth2_client::{GrantType, OidcAccessTokenClaims};
 
 use crate::audit::{Oauth2Grant, build_initiator_from_user_id, emit_oauth2_grant_event};
@@ -174,7 +174,7 @@ pub(super) async fn handle_authorization_code_grant(
             jti: uuid::Uuid::new_v4().to_string(),
             scope: record.scope.join(" "),
             token_use: "access".to_string(),
-            sid: sid.clone(),
+            family_id: sid.clone(),
         };
         let access_token = sign_jwt(state, domain_id, &access_claims).await?;
 
@@ -191,6 +191,10 @@ pub(super) async fn handle_authorization_code_grant(
                 nonce: record.nonce.clone(),
                 amr: record.amr.clone(),
                 at_hash: Some(compute_at_hash(&access_token)),
+                sid: record
+                    .sso_id
+                    .as_deref()
+                    .map(|sso_id| derive_sid(&sso_ref(sso_id), &client_id)),
             },
             &record.scope,
             &TemplateScope::default(),
@@ -261,6 +265,7 @@ mod tests {
 
     fn sample_authz_code(scope: Vec<String>) -> AuthorizationCode {
         AuthorizationCode {
+            sso_id: None,
             upstream: None,
             code: "code-1".to_string(),
             domain_id: "domain-1".to_string(),
@@ -487,7 +492,7 @@ mod tests {
         assert!(body.get("refresh_token").is_none());
         // No refresh family, hence no session id.
         let claims = jwt_claims(body["access_token"].as_str().unwrap());
-        assert!(claims.get("sid").is_none());
+        assert!(claims.get("fid").is_none());
     }
 
     #[tokio::test]
@@ -547,7 +552,7 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["refresh_token"], "refresh-bearer");
         let claims = jwt_claims(body["access_token"].as_str().unwrap());
-        assert_eq!(claims["sid"], "family-9");
+        assert_eq!(claims["fid"], "family-9");
     }
 
     #[tokio::test]

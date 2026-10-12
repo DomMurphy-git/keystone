@@ -58,6 +58,12 @@ pub struct IdTokenClaims {
     /// access-token substitution attacks at the RP. Omitted when no
     /// `access_token` is issued alongside it.
     pub at_hash: Option<String>,
+    /// Identifier of the SSO session as seen by this relying party (OIDC
+    /// Front/Back-Channel Logout `sid`); equals the `sid` of the logout
+    /// token sent when that session ends. Omitted for grants without an
+    /// SSO session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     /// Fixed `"id"` (OIDC Core §3.1.3.4). Downstream services reject this
     /// token as authorization.
     pub token_use: String,
@@ -99,13 +105,14 @@ pub struct OidcAccessTokenClaims {
     /// Fixed `"access"` (mirrors [`IdTokenClaims::token_use`]); downstream
     /// middleware checks this alongside `openstack_context` presence.
     pub token_use: String,
-    /// Session id: the `family_id` of the refresh-token family minted
+    /// Refresh family: the `family_id` of the refresh-token family minted
     /// alongside (or rotated into) this token, when the client holds the
     /// `refresh_token` grant. Lets the RFC 7009 revocation endpoint end the
-    /// whole session when an access token is revoked. Private claim (OIDC
-    /// `sid`-style); absent for clients without refresh tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sid: Option<String>,
+    /// whole family when an access token is revoked. Private claim, named
+    /// `fid` so it is not mistaken for the OIDC `sid` of the SSO session
+    /// (older tokens carry it as `sid`, which verification still accepts).
+    #[serde(default, rename = "fid", skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
 }
 
 /// Audience of an OpenStack access token: the whole control plane of the
@@ -432,6 +439,7 @@ mod tests {
             nonce: Some("abc".to_string()),
             amr: vec!["pwd".to_string()],
             at_hash: None,
+            sid: None,
             token_use: "id".to_string(),
             extra_claims,
         };
@@ -453,18 +461,18 @@ mod tests {
             jti: "jti-1".to_string(),
             scope: "openid profile".to_string(),
             token_use: "access".to_string(),
-            sid: None,
+            family_id: None,
         };
         let value = serde_json::to_value(&claims).unwrap();
         assert_eq!(value["aud"], "client-1");
         assert_eq!(value["token_use"], "access");
-        assert!(value.get("sid").is_none());
+        assert!(value.get("fid").is_none());
 
-        let with_sid = OidcAccessTokenClaims {
-            sid: Some("family-1".to_string()),
+        let with_family = OidcAccessTokenClaims {
+            family_id: Some("family-1".to_string()),
             ..claims
         };
-        let value = serde_json::to_value(&with_sid).unwrap();
-        assert_eq!(value["sid"], "family-1");
+        let value = serde_json::to_value(&with_family).unwrap();
+        assert_eq!(value["fid"], "family-1");
     }
 }

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use openstack_keystone_core_types::oauth2_session::{
     AuthorizationCode, Consent, DeviceCodeGrant, PreAuthSession, RefreshToken,
-    RefreshTokenRevocationReason, SsoSession, UpstreamLogin, UpstreamLoginCompletion,
+    RefreshTokenRevocationReason, RpSession, SsoSession, UpstreamLogin, UpstreamLoginCompletion,
 };
 
 use crate::keystone::ServiceState;
@@ -74,6 +74,9 @@ pub struct IssueAuthorizationCodeRequest {
     pub amr: Vec<String>,
     /// Upstream login the session came from (federated sign-in only).
     pub upstream: Option<UpstreamLogin>,
+    /// The SSO session the code is issued under; basis of the `sid`
+    /// claim.
+    pub sso_id: Option<String>,
 }
 
 /// Input to [`Oauth2SessionApi::issue_refresh_token`] (family root) --
@@ -255,6 +258,16 @@ pub trait Oauth2SessionApi: Send + Sync {
         sso_id: &str,
     ) -> Result<(), Oauth2SessionProviderError>;
 
+    /// End an SSO session because a new sign-in replaces it. Unlike
+    /// [`Oauth2SessionApi::delete_sso_session`] the relying parties are not
+    /// told: the user is signing in again right now, and a logout token
+    /// from an RP that ignores `sid` would end the new session as well.
+    async fn replace_sso_session(
+        &self,
+        state: &ServiceState,
+        sso_id: &str,
+    ) -> Result<(), Oauth2SessionProviderError>;
+
     /// The SSO sessions of the user in the domain.
     async fn list_sso_sessions_by_user(
         &self,
@@ -278,7 +291,16 @@ pub trait Oauth2SessionApi: Send + Sync {
         &self,
         state: &ServiceState,
         user_id: &str,
-    ) -> Result<Vec<String>, Oauth2SessionProviderError>;
+    ) -> Result<Vec<RpSession>, Oauth2SessionProviderError>;
+
+    /// Forget the relying parties issued under one SSO session and return
+    /// the ones removed: the caller notifies exactly these.
+    async fn delete_rp_sessions_by_sso(
+        &self,
+        state: &ServiceState,
+        user_id: &str,
+        sso_id: &str,
+    ) -> Result<Vec<RpSession>, Oauth2SessionProviderError>;
 
     /// End every SSO session of the user (user disabled, deleted, password
     /// changed); returns how many.

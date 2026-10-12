@@ -21,16 +21,17 @@ use rand::distr::{Alphanumeric, SampleString};
 use sha2::{Digest, Sha256};
 
 use openstack_keystone_config::Config;
+use openstack_keystone_core_types::events::{Event, EventPayload, Operation};
 use openstack_keystone_core_types::oauth2_session::*;
 
 use crate::keystone::ServiceState;
-use crate::oauth2_session::Oauth2SessionProviderError;
 use crate::oauth2_session::backend::Oauth2SessionBackend;
 use crate::oauth2_session::provider_api::{
     CreateSsoSessionRequest, DeviceAuthorizationStart, DevicePollOutcome,
     IssueAuthorizationCodeRequest, IssueRefreshTokenRequest, Oauth2SessionApi,
     RefreshTokenRedemption, StartDeviceAuthorizationRequest, StartPreAuthSessionRequest,
 };
+use crate::oauth2_session::{Oauth2SessionProviderError, sso_ref};
 use crate::plugin_manager::PluginManagerApi;
 
 /// The only backend name registered for the OAuth2 session provider (like
@@ -86,6 +87,47 @@ pub struct Oauth2SessionService {
 }
 
 impl Oauth2SessionService {
+    /// End an SSO session and announce it.
+    ///
+    /// `notify` = the relying parties are to be told (`Delete`); otherwise
+    /// the session was replaced by a new sign-in, no logout token is sent
+    /// and the event is audit-only.
+    async fn end_sso_session(
+        &self,
+        state: &ServiceState,
+        sso_id: &str,
+        notify: bool,
+    ) -> Result<(), Oauth2SessionProviderError> {
+        let record = self.backend_driver.get_sso_session(state, sso_id).await?;
+        self.backend_driver
+            .delete_sso_session(state, sso_id)
+            .await?;
+        let Some(session) = record else {
+            return Ok(());
+        };
+        let reference = sso_ref(sso_id);
+        // A replaced session keeps its relying-party records: they are
+        // still signed in, and a later user-wide logout (disable, delete,
+        // password change) must reach them.
+        let operation = if notify {
+            Operation::Delete
+        } else {
+            Operation::Other("sso_session_replaced".to_string())
+        };
+        state
+            .event_dispatcher
+            .emit(Event::new(
+                operation,
+                EventPayload::Oauth2SsoSession {
+                    domain_id: session.domain_id,
+                    user_id: session.user_id,
+                    sso_ref: reference,
+                },
+            ))
+            .await;
+        Ok(())
+    }
+
     /// A device grant can only be signed in while it is still `Pending` and
     /// unexpired; a decided or expired one must not be re-authenticated.
     async fn ensure_device_grant_open(
@@ -310,11 +352,7 @@ impl Oauth2SessionApi for Oauth2SessionService {
                     .filter(|s| s.sso_id != created.sso_id)
                     .take(excess)
                 {
-                    if let Err(e) = self
-                        .backend_driver
-                        .delete_sso_session(state, &old.sso_id)
-                        .await
-                    {
+                    if let Err(e) = self.end_sso_session(state, &old.sso_id, true).await {
                         tracing::warn!(error = %e, "oauth2 SSO session eviction failed");
                     }
                 }
@@ -339,8 +377,10 @@ impl Oauth2SessionApi for Oauth2SessionService {
             return Ok(None);
         };
         if session.expires_at < now() {
-            // Best-effort cleanup on expired read.
-            let _ = self.backend_driver.delete_sso_session(state, sso_id).await;
+            // Best-effort cleanup on expired read; the janitor retries.
+            if let Err(e) = self.end_sso_session(state, sso_id, true).await {
+                tracing::warn!(error = %e, "oauth2 expired SSO session could not be ended");
+            }
             return Ok(None);
         }
         Ok(Some(session))
@@ -356,7 +396,20 @@ impl Oauth2SessionApi for Oauth2SessionService {
         state: &ServiceState,
         sso_id: &str,
     ) -> Result<(), Oauth2SessionProviderError> {
-        self.backend_driver.delete_sso_session(state, sso_id).await
+        self.end_sso_session(state, sso_id, true).await
+    }
+
+    #[tracing::instrument(
+        name = "provider.oauth2_session.replace_sso_session",
+        level = "debug",
+        skip_all
+    )]
+    async fn replace_sso_session(
+        &self,
+        state: &ServiceState,
+        sso_id: &str,
+    ) -> Result<(), Oauth2SessionProviderError> {
+        self.end_sso_session(state, sso_id, false).await
     }
 
     #[tracing::instrument(name = "provider.oauth2_session.list_sso_sessions_by_user", level = "debug", skip_all, fields(user_id = %user_id))]
@@ -387,9 +440,21 @@ impl Oauth2SessionApi for Oauth2SessionService {
         &self,
         state: &ServiceState,
         user_id: &str,
-    ) -> Result<Vec<String>, Oauth2SessionProviderError> {
+    ) -> Result<Vec<RpSession>, Oauth2SessionProviderError> {
         self.backend_driver
             .delete_rp_sessions_by_user(state, user_id)
+            .await
+    }
+
+    #[tracing::instrument(name = "provider.oauth2_session.delete_rp_sessions_by_sso", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn delete_rp_sessions_by_sso(
+        &self,
+        state: &ServiceState,
+        user_id: &str,
+        sso_id: &str,
+    ) -> Result<Vec<RpSession>, Oauth2SessionProviderError> {
+        self.backend_driver
+            .delete_rp_sessions_by_sso(state, user_id, sso_id)
             .await
     }
 
@@ -410,9 +475,22 @@ impl Oauth2SessionApi for Oauth2SessionService {
         state: &ServiceState,
         domain_id: &str,
     ) -> Result<usize, Oauth2SessionProviderError> {
-        self.backend_driver
-            .delete_sso_sessions_by_domain(state, domain_id)
-            .await
+        // End the sessions one by one so each tells its relying parties;
+        // the sweep catches the ones created in between.
+        let mut ended = 0;
+        for session in self
+            .backend_driver
+            .list_sso_sessions_by_domain(state, domain_id)
+            .await?
+        {
+            self.end_sso_session(state, &session.sso_id, true).await?;
+            ended += 1;
+        }
+        Ok(ended
+            + self
+                .backend_driver
+                .delete_sso_sessions_by_domain(state, domain_id)
+                .await?)
     }
 
     #[tracing::instrument(name = "provider.oauth2_session.remember_consent", level = "debug", skip_all, fields(client_id = %client_id))]
@@ -656,6 +734,7 @@ impl Oauth2SessionApi for Oauth2SessionService {
                     auth_time: req.auth_time,
                     amr: req.amr,
                     upstream: req.upstream,
+                    sso_id: req.sso_id,
                     created_at,
                     expires_at,
                 },
@@ -1288,11 +1367,7 @@ impl Oauth2SessionApi for Oauth2SessionService {
                 .take_device_code_grant(state, primary_key)
                 .await
                 .map(|_| ()),
-            "sso" => {
-                self.backend_driver
-                    .delete_sso_session(state, primary_key)
-                    .await
-            }
+            "sso" => self.end_sso_session(state, primary_key, true).await,
             "refresh" | "refresh_tombstone" => {
                 self.backend_driver
                     .delete_refresh_token(state, primary_key)
@@ -1695,6 +1770,7 @@ mod tests {
         mock.expect_take_authorization_code().returning(|_, _| {
             Ok(Some(AuthorizationCode {
                 upstream: None,
+                sso_id: None,
                 code: "code-1".to_string(),
                 domain_id: "d1".to_string(),
                 client_id: "c1".to_string(),
@@ -2595,6 +2671,8 @@ mod tests {
                     sso("new", i64::MAX),
                 ])
             });
+        mock.expect_get_sso_session()
+            .returning(|_, id| Ok(Some(sso(id, 10))));
         mock.expect_delete_sso_session()
             .withf(|_, id| id == "old-1")
             .times(1)
@@ -2722,5 +2800,89 @@ mod tests {
             .begin_device_upstream_login(&state, "device-code-1", "idp-1", "state-1")
             .await
             .unwrap();
+    }
+
+    /// Records the SSO session events it is dispatched.
+    struct SsoEvents(std::sync::Mutex<Vec<(String, String, String)>>);
+
+    #[async_trait]
+    impl crate::events::ProviderHooks for SsoEvents {
+        async fn on_event(&self, event: &Event) {
+            if let EventPayload::Oauth2SsoSession {
+                user_id, sso_ref, ..
+            } = &event.payload
+            {
+                self.0.lock().unwrap().push((
+                    format!("{:?}", event.operation),
+                    user_id.clone(),
+                    sso_ref.clone(),
+                ));
+            }
+        }
+    }
+
+    async fn recorded(hook: &SsoEvents) -> Vec<(String, String, String)> {
+        // Hooks run in spawned tasks.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            if !hook.0.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        hook.0.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn test_ending_an_sso_session_announces_it_by_reference_not_by_id() {
+        let state = get_mocked_state(None, None).await;
+        let hook = Arc::new(SsoEvents(Default::default()));
+        state.event_dispatcher.subscribe(hook.clone()).await;
+        let mut mock = MockOauth2SessionBackend::new();
+        mock.expect_get_sso_session()
+            .returning(|_, _| Ok(Some(sso("sso-1", 10))));
+        mock.expect_delete_sso_session()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let service = service_with(mock);
+        service.delete_sso_session(&state, "sso-1").await.unwrap();
+
+        let events = recorded(&hook).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "Delete");
+        assert_eq!(events[0].2, sso_ref("sso-1"));
+        assert_ne!(events[0].2, "sso-1");
+    }
+
+    #[tokio::test]
+    async fn test_replacing_an_sso_session_keeps_its_rps_and_sends_no_logout_event() {
+        let state = get_mocked_state(None, None).await;
+        let hook = Arc::new(SsoEvents(Default::default()));
+        state.event_dispatcher.subscribe(hook.clone()).await;
+        let mut mock = MockOauth2SessionBackend::new();
+        mock.expect_get_sso_session()
+            .returning(|_, _| Ok(Some(sso("sso-1", 10))));
+        mock.expect_delete_sso_session().returning(|_, _| Ok(()));
+        // The relying parties stay recorded for a later user-wide logout.
+        mock.expect_delete_rp_sessions_by_sso().never();
+        let service = service_with(mock);
+        service.replace_sso_session(&state, "sso-1").await.unwrap();
+
+        let events = recorded(&hook).await;
+        assert_eq!(events.len(), 1);
+        assert_ne!(events[0].0, "Delete");
+    }
+
+    #[tokio::test]
+    async fn test_ending_a_missing_sso_session_announces_nothing() {
+        let state = get_mocked_state(None, None).await;
+        let hook = Arc::new(SsoEvents(Default::default()));
+        state.event_dispatcher.subscribe(hook.clone()).await;
+        let mut mock = MockOauth2SessionBackend::new();
+        mock.expect_get_sso_session().returning(|_, _| Ok(None));
+        mock.expect_delete_sso_session().returning(|_, _| Ok(()));
+        let service = service_with(mock);
+        service.delete_sso_session(&state, "gone").await.unwrap();
+        assert!(recorded(&hook).await.is_empty());
     }
 }

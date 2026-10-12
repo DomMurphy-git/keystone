@@ -244,7 +244,7 @@ pub(super) async fn handle_device_code_grant(
             jti: uuid::Uuid::new_v4().to_string(),
             scope: record.scope.join(" "),
             token_use: "access".to_string(),
-            sid: sid.clone(),
+            family_id: sid.clone(),
         };
         let access_token = sign_jwt(state, domain_id, &access_claims).await?;
 
@@ -262,6 +262,8 @@ pub(super) async fn handle_device_code_grant(
                     nonce: record.nonce.clone(),
                     amr: record.amr.clone(),
                     at_hash: Some(compute_at_hash(&access_token)),
+                    // Device grants have no SSO session, hence no `sid`.
+                    sid: None,
                 },
                 &record.scope,
                 &TemplateScope::default(),

@@ -361,7 +361,7 @@ mod oauth2_session {
 
     use openstack_keystone_core_types::oauth2_session::{
         AuthorizationCode, Consent, DeviceCodeGrant, PreAuthSession, RefreshToken,
-        RefreshTokenRevocationReason, SsoSession, UpstreamLoginCompletion,
+        RefreshTokenRevocationReason, RpSession, SsoSession, UpstreamLoginCompletion,
     };
 
     use crate::oauth2_session::provider_api::{
@@ -415,6 +415,12 @@ mod oauth2_session {
                 sso_id: &str,
             ) -> Result<(), Oauth2SessionProviderError>;
 
+            async fn replace_sso_session(
+                &self,
+                state: &ServiceState,
+                sso_id: &str,
+            ) -> Result<(), Oauth2SessionProviderError>;
+
             async fn list_sso_sessions_by_user(
                 &self,
                 state: &ServiceState,
@@ -432,7 +438,14 @@ mod oauth2_session {
                 &self,
                 state: &ServiceState,
                 user_id: &str,
-            ) -> Result<Vec<String>, Oauth2SessionProviderError>;
+            ) -> Result<Vec<RpSession>, Oauth2SessionProviderError>;
+
+            async fn delete_rp_sessions_by_sso(
+                &self,
+                state: &ServiceState,
+                user_id: &str,
+                sso_id: &str,
+            ) -> Result<Vec<RpSession>, Oauth2SessionProviderError>;
 
             async fn delete_sso_sessions_by_user(
                 &self,
