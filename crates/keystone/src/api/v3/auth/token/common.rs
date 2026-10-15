@@ -834,6 +834,7 @@ mod tests {
 /// hacked_appcred_handler`) and `hacked_appcred_handler` (`mode = full_auth`) -
 /// the allowlisted target the router may redirect to.
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 mod route_dispatch_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;

@@ -2011,6 +2011,7 @@ mod tests {
 /// fills that gap for `mapping` mode and for `route` mode redirecting to a
 /// real `full_auth` target.
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 mod auth_plugin_http_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;

@@ -964,6 +964,7 @@ pub async fn route_via_wasm_plugin(
 /// dev-dependency of this crate for exactly this purpose - it never appears
 /// in a non-test build.
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 async fn load_plugins_for_test(
     state: &ServiceState,
     http_fetcher: std::sync::Arc<dyn crate::auth_plugin_http::DynamicPluginHttpFetcher>,
@@ -1002,6 +1003,7 @@ async fn load_plugins_for_test(
 }
 
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 mod acceptance_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1542,6 +1544,7 @@ mod flatten_plugin_claims_tests {
 /// expects (`IdentitySource::WasmPlugin`, flattened claims, `domain_id:
 /// None`).
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 mod mapping_acceptance_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1795,6 +1798,7 @@ mod mapping_acceptance_tests {
 /// check that the guest contract's own decoder can't perform (it has no
 /// visibility into config state).
 #[cfg(test)]
+#[cfg(feature = "wasm_plugins")]
 mod route_acceptance_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
